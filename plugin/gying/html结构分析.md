@@ -32,9 +32,9 @@ https://www.gying.net
 
 | 功能 | URL |
 | --- | --- |
-| 登录页 | `{baseURL}/user/login/` |
+| 登录页 / 初始会话页 | `{baseURL}` |
 | 登录接口 | `{baseURL}/user/login` |
-| 搜索页 | `{baseURL}/s/1---1/{keyword}` |
+| 搜索页 | `{baseURL}/search?q={keyword}&type=0&mode=2` |
 | 详情接口 | `{baseURL}/res/downurl/{type}/{id}` |
 | 预热详情页 | `{baseURL}/mv/wkMn` |
 
@@ -54,7 +54,7 @@ https://www.gying.net
 搜索与详情请求也不是写死域名，而是分别拼接为：
 
 ```text
-{baseURL}/s/1---1/{keyword}
+{baseURL}/search?q={keyword}&type=0&mode=2
 {baseURL}/res/downurl/{type}/{id}
 ```
 
@@ -67,10 +67,14 @@ https://www.gying.net
 
 ### 识别方式
 
-插件会把下面两条同时成立的响应视为挑战页：
+插件会把“页面中存在如下 JS 片段”且正文包含任一验证文案的响应视为挑战页：
 
-1. 页面文本包含 `正在确认你是不是机器人`
-2. 页面中存在如下 JS 片段：
+- `正在确认你是不是机器人`
+- `浏览器安全验证`
+- `安全验证`
+- `正在进行浏览器计算验证`
+
+挑战页中会出现如下 JS 片段：
 
 ```javascript
 const json={...};const jss=
@@ -129,7 +133,7 @@ action=verify&id={id}&nonce[]={n1}&nonce[]={n2}...
 请求：
 
 ```text
-GET {baseURL}/user/login/
+GET {baseURL}
 ```
 
 作用：
@@ -176,14 +180,62 @@ GET {baseURL}/mv/wkMn
 
 - HTTP 403
 - 返回登录壳页面：`_BT.PC.HTML('login')`
+- 返回未登录壳页面：`_BT.PC.HTML('nologin')`
+- 页面标题或正文出现 `未登录，访问受限`
 - 详情 JSON 里的 `code == 403`
+
+### Cookie 生命周期
+
+当前站点至少有两类不同作用的 Cookie：
+
+- 登录态 Cookie：例如 `PHPSESSID`、`app_auth`
+- 验证态 Cookie：例如 `browser_verified`
+
+两者不是同一层状态：
+
+- 只有登录态，没有验证态：搜索时仍可能进入“浏览器安全验证”
+- 只有验证态，没有有效登录态：搜索可能不再 challenge，但会落到 `nologin`
+
+当前插件的处理链路是：
+
+1. 登录 / 重登成功后，导出整套 Cookie 快照并保存到用户文件
+2. 搜索过程中如果 challenge 求解成功，服务端补发的 `browser_verified` 会进入 scraper 的 cookie jar
+3. 单次搜索成功后，插件会把 scraper 中最新 Cookie 再次导出并回写到用户文件
+4. 插件重启后，优先使用已保存 Cookie 恢复 scraper 会话；只有恢复失败时才回退到用户名密码重新登录
+
+这样做的目的，是尽量复用已经通过的浏览器验证结果，减少不必要的重复 challenge。
+
+### 代理前提
+
+当前目标站点对网络出口非常敏感。
+
+实测里，同一个 `/search` 地址在不同请求链上可能出现两种完全不同的表现：
+
+- 可访问网络出口：先返回 challenge，再返回 `_obj.search`
+- 受限网络出口：直接返回由 `Angie` 输出的 `404 Not Found` 假页
+
+也就是说，这类 404 不能直接解释为“搜索参数错误”或“路由不存在”，它很可能只是站点对当前网络出口的伪装拒绝。
+
+为了解决这一点，当前 `gying` 会显式把主程序的 `PROXY` 配置应用到 `cloudscraper` 内部 transport，而不是只依赖库默认行为。
+
+当前代理应用点包括：
+
+1. `doLogin()` 创建 scraper 时
+2. `createScraperWithCookies()` 恢复 scraper 时
+3. 随后的搜索页、详情页、challenge 提交请求
+
+支持的代理类型与主程序一致：
+
+- `socks5://...`
+- `http://...`
+- `https://...`
 
 ## 4. 搜索页 HTML 结构
 
 ### 搜索地址
 
 ```text
-GET {baseURL}/s/1---1/{url.QueryEscape(keyword)}
+GET {baseURL}/search?q={url.QueryEscape(keyword)}&type=0&mode=2
 ```
 
 返回值不是纯 JSON，而是一个 HTML 页面。真正的数据被嵌在 JavaScript 变量里：
@@ -270,14 +322,14 @@ type DetailData struct {
         } `json:"type"`
         Hex  string `json:"hex"`
         List struct {
-            M []string `json:"m"`
-            T []string `json:"t"`
-            S []string `json:"s"`
-            E []int    `json:"e"`
-            P []string `json:"p"`
-            U []string `json:"u"`
-            K []int    `json:"k"`
-            N []string `json:"n"`
+            M []string      `json:"m"`
+            T []string      `json:"t"`
+            S []string      `json:"s"`
+            E []interface{} `json:"e"`
+            P []string      `json:"p"`
+            U []string      `json:"u"`
+            K []interface{} `json:"k"`
+            N []string      `json:"n"`
         } `json:"list"`
     } `json:"downlist"`
     Panlist struct {
@@ -308,6 +360,23 @@ type DetailData struct {
 | `downlist.list.t` | 资源名 | 作为 magnet `dn` |
 | `downlist.list.s` | 文件大小 | 资源名兜底 |
 | `downlist.list.n` | 更新时间 | 链接时间、结果时间 |
+
+### 结构兼容性说明
+
+当前站点的详情 JSON 并不是所有字段都严格稳定。
+
+实测里，`downlist.list.e` 和 `downlist.list.k` 可能混用：
+
+- `int`
+- `string`
+
+例如某些条目会返回：
+
+- `e: [1, 0, 0, 9, 0]`
+- `e: ["-1"]`
+- `e: [0, 10, "-1", "-1"]`
+
+因此当前实现把这两个字段按宽松类型接收，避免因为单个字段的类型漂移导致整条详情 JSON 反序列化失败。
 
 ## 6. SearchResult 映射逻辑
 
@@ -438,11 +507,12 @@ gying-{resourceType}-{resourceID}
 2. 读取插件内关键词缓存
 3. 获取全部活跃用户
 4. 为每个用户取 scraper，没有 scraper 时用已保存 Cookie 恢复
-5. 请求搜索页，提取 `_obj.search`
+5. 请求搜索页；如果遇到浏览器验证页则自动求解后重试
 6. 再访问一次预热详情页刷新反爬 Cookie
-7. 并发拉取详情接口
-8. 构造结果和链接
-9. 聚合多用户结果并按 `UniqueID` 去重
+7. 提取 `_obj.search`
+8. 并发拉取详情接口
+9. 构造结果和链接
+10. 聚合多用户结果并按 `UniqueID` 去重
 
 其中并发限制由两个常量控制：
 
